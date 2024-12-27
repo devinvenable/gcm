@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+
+###############################################################################
+# gcm: A Git commit replacement tool that:
+#   1. Collects the Git diff in the current directory.
+#   2. Searches for an .env file (up to grandparent level) containing OPENAI_API_KEY.
+#   3. Calls OpenAI's API to summarize the changes.
+#   4. Commits the code with the generated summary.
+###############################################################################
+
+# --- Utility function: Print error message to stderr ---
+error_exit() {
+  echo "[ERROR] $1" >&2
+  exit 1
+}
+
+# --- 1. Capture Git diff -----------------------------------------------------
+# By default, we’ll show staged changes. You can change to `git diff HEAD` or
+# `git diff` if desired.
+diff_data=$(git diff --staged)
+if [ -z "$diff_data" ]; then
+  echo "No staged changes found. Please stage your changes with \`git add\` first."
+  exit 1
+fi
+
+# --- 2. Locate .env file containing OPENAI_API_KEY ---------------------------
+# We'll search the current directory, then parent, then grandparent:
+# If you prefer a more brute force approach, you could do:
+#   find ../../../ -type f -name ".env"
+# and parse them. But here's a quick approach:
+env_file=""
+search_dirs=("./" "../" "../../")
+for dir in "${search_dirs[@]}"; do
+  candidate="$dir.env"
+  if [[ -f "$candidate" ]]; then
+    if grep -q 'OPENAI_API_KEY' "$candidate"; then
+      env_file="$candidate"
+      break
+    fi
+  fi
+done
+
+# If not found, you can do a fallback wide search:
+if [[ -z "$env_file" ]]; then
+  # If you want to do the "find ../../../ -name .env" approach:
+  # We limit search to 3 levels up (or adjust as needed).
+  IFS=$'\n'
+  for candidate in $(find ../../../ -maxdepth 3 -type f -name ".env" 2>/dev/null); do
+    if grep -q 'OPENAI_API_KEY' "$candidate"; then
+      env_file="$candidate"
+      break
+    fi
+  done
+  unset IFS
+fi
+
+if [[ -z "$env_file" ]]; then
+  error_exit "Could not find a .env file with OPENAI_API_KEY in the current, parent or grandparent directories."
+fi
+
+# Source the .env file to bring OPENAI_API_KEY into this environment
+set -a
+# shellcheck source=/dev/null
+. "$env_file"
+set +a
+
+if [[ -z "$OPENAI_API_KEY" ]]; then
+  error_exit "OPENAI_API_KEY is not set in $env_file"
+fi
+
+# --- 3. Call OpenAI API to summarize the diff --------------------------------
+# We’ll use a quick curl request to the Chat Completion endpoint (e.g., GPT-3.5-Turbo).
+# Adjust model/temperature/prompt as desired. This is just an example.
+
+# Prepare the prompt for summarizing changes
+read -r -d '' prompt <<EOF
+You are a helpful coding assistant. Please read the following Git diff and provide a concise summary of the changes suitable for a commit message.
+
+Diff:
+$diff_data
+
+EOF
+
+# Call OpenAI
+response=$(curl -s https://api.openai.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d '{
+    "model": "gpt-3.5-turbo",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant specialized in writing concise commit messages."},
+      {"role": "user", "content": "'"${prompt//\"/\\\"}"'"}
+    ],
+    "temperature": 0.7
+  }')
+
+# Extract the generated message (the commit summary)
+# We'll parse out the "content" from the last assistant message:
+commit_summary=$(echo "$response" | grep -o '"content":"[^"]*"' | sed 's/"content":"\(.*\)"/\1/g')
+
+# If you want to handle JSON more robustly, consider installing jq
+#   commit_summary=$(echo "$response" | jq -r '.choices[0].message.content')
+
+if [[ -z "$commit_summary" ]]; then
+  error_exit "OpenAI API did not return a commit summary. Response: $response"
+fi
+
+# --- 4. Perform the actual Git commit ----------------------------------------
+# Use the generated summary as the commit message
+git commit -m "$commit_summary"
+
