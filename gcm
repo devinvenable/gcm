@@ -73,7 +73,7 @@ fi
 # pass it to `jq` or Python to safely encode it into JSON.
 
 read -r -d '' prompt <<EOF
-You are a helpful coding assistant. Please read the following Git diff and provide a concise summary of the changes suitable for a commit message. Also, list an array of functions that were removed, if true.
+You are a helpful coding assistant. Please read the following Git diff and provide a concise summary of the changes suitable for a commit message. Also, list functions that were added or removed.
 
 Diff:
 $diff_data
