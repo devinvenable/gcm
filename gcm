@@ -26,10 +26,10 @@ if [ -z "$diff_data" ]; then
 fi
 
 ###############################################################################
-# Step 2: Locate .env file containing OPENAI_API_KEY (up to 3 levels)
+# Step 2: Locate .env file containing OPENAI_API_KEY (up to 5 levels)
 ###############################################################################
 env_file=""
-search_dirs=("./" "../" "../../")
+search_dirs=("./" "../" "../../" "../../../" "../../../../../")
 for dir in "${search_dirs[@]}"; do
   candidate="${dir}.env"
   if [[ -f "$candidate" ]]; then
@@ -73,7 +73,7 @@ fi
 # pass it to `jq` or Python to safely encode it into JSON.
 
 read -r -d '' prompt <<EOF
-You are a helpful coding assistant. Please read the following Git diff and provide a concise summary of the changes suitable for a commit message. Also, list functions that were added or removed.
+You are a helpful coding assistant. Please read the following Git diff and provide a concise summary of the changes suitable for a commit message. Also, list functions that were added or removed. On first line, do not use the word "summary" but instead use a single sentence that encapsulates or generalizes the entire commit. On subsequent lines you can go into more detail.
 
 Diff:
 $diff_data
