@@ -126,12 +126,8 @@ EOF
 else # openai
   json_payload=$(cat <<EOF
 {
-  "model": "gpt-3.5-turbo",
+  "model": "gpt-4o-mini",
   "messages": [
-    {
-      "role": "system",
-      "content": "You are a helpful assistant specialized in writing concise commit messages."
-    },
     {
       "role": "user", 
       "content": $prompt_json
@@ -178,12 +174,8 @@ if [[ "$api_provider" == "gemini" ]]; then
       # Construct OpenAI payload
       openai_payload=$(cat <<EOF
 {
-  "model": "gpt-3.5-turbo",
+  "model": "gpt-4o-mini",
   "messages": [
-    {
-      "role": "system",
-      "content": "You are a helpful assistant specialized in writing concise commit messages."
-    },
     {
       "role": "user", 
       "content": $prompt_json
@@ -204,6 +196,9 @@ EOF
       if [[ $openai_response == *"error"* ]]; then
         openai_error=$(echo "$openai_response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"\(.*\)"/\1/g')
         echo "OpenAI API error: $openai_error"
+        echo "Full OpenAI response: $openai_response"
+        
+        # Only fall back to Gemini if GEMINI_API_KEY is available
       else
         # Parse OpenAI response
         response=$openai_response
@@ -249,6 +244,7 @@ else # openai as primary choice
   if [[ $openai_response == *"error"* ]]; then
     openai_error=$(echo "$openai_response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"\(.*\)"/\1/g')
     echo "OpenAI API error: $openai_error"
+    echo "Full OpenAI response: $openai_response"
     
     # Only fall back to Gemini if GEMINI_API_KEY is available
     if [[ -n "$GEMINI_API_KEY" ]]; then
