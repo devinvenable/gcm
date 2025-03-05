@@ -2,11 +2,11 @@
 #
 # gcm: A Git commit replacement tool that:
 #   1. Collects the Git diff in the current directory (staged changes).
-#   2. Searches for a .env file (up to 3 parent levels) containing OPENAI_API_KEY.
-#   3. Calls OpenAI's Chat Completion API to summarize the changes.
+#   2. Searches for a .env file (up to 3 parent levels) containing API keys.
+#   3. Calls Gemini API (preferred) or OpenAI API (fallback) to summarize the changes.
 #   4. Commits the code with the generated summary.
 #
-# This version includes debug output AND robust JSON escaping.
+# This version includes support for both Gemini and OpenAI APIs.
 
 ###############################################################################
 # Utility function: Print error message to stderr and exit
@@ -26,17 +26,19 @@ if [ -z "$diff_data" ]; then
 fi
 
 ###############################################################################
-# Step 2: Locate .env file containing OPENAI_API_KEY (up to 5 levels)
+# Step 2: Set or locate API keys
 ###############################################################################
+# First check the environment variables
+api_provider=""
+
+# Try to find .env file containing API keys
 env_file=""
 search_dirs=("./" "../" "../../" "../../../" "../../../../../")
 for dir in "${search_dirs[@]}"; do
   candidate="${dir}.env"
   if [[ -f "$candidate" ]]; then
-    if grep -q 'OPENAI_API_KEY' "$candidate"; then
-      env_file="$candidate"
-      break
-    fi
+    env_file="$candidate"
+    break
   fi
 done
 
@@ -44,26 +46,30 @@ done
 if [[ -z "$env_file" ]]; then
   IFS=$'\n'
   for candidate in $(find ../../../ -maxdepth 3 -type f -name ".env" 2>/dev/null); do
-    if grep -q 'OPENAI_API_KEY' "$candidate"; then
-      env_file="$candidate"
-      break
-    fi
+    env_file="$candidate"
+    break
   done
   unset IFS
 fi
 
-if [[ -z "$env_file" ]]; then
-  error_exit "Could not find a .env file with OPENAI_API_KEY (checked up to 3 levels up)."
+# Source the .env file if found
+if [[ -n "$env_file" ]]; then
+  echo "Loading API keys from $env_file"
+  set -a
+  # shellcheck source=/dev/null
+  . "$env_file"
+  set +a
 fi
 
-# Source the .env file to load OPENAI_API_KEY
-set -a
-# shellcheck source=/dev/null
-. "$env_file"
-set +a
-
-if [[ -z "$OPENAI_API_KEY" ]]; then
-  error_exit "OPENAI_API_KEY is not defined in $env_file."
+# Determine which API to use (prefer Gemini over OpenAI)
+if [[ -n "$GEMINI_API_KEY" ]]; then
+  api_provider="gemini"
+  echo "Using Gemini API"
+elif [[ -n "$OPENAI_API_KEY" ]]; then
+  api_provider="openai"
+  echo "Using OpenAI API (Gemini API key not found)"
+else
+  error_exit "Neither GEMINI_API_KEY nor OPENAI_API_KEY is defined in environment or in a .env file."
 fi
 
 ###############################################################################
@@ -96,9 +102,29 @@ if [[ -z "$prompt_json" ]]; then
 fi
 
 ###############################################################################
-# Step 5: Construct the full JSON payload
+# Step 5: Construct the JSON payload based on API provider
 ###############################################################################
-json_payload=$(cat <<EOF
+if [[ "$api_provider" == "gemini" ]]; then
+  json_payload=$(cat <<EOF
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": $prompt_json
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "temperature": 0.7
+  }
+}
+EOF
+)
+else # openai
+  json_payload=$(cat <<EOF
 {
   "model": "gpt-3.5-turbo",
   "messages": [
@@ -107,7 +133,7 @@ json_payload=$(cat <<EOF
       "content": "You are a helpful assistant specialized in writing concise commit messages."
     },
     {
-      "role": "user",
+      "role": "user", 
       "content": $prompt_json
     }
   ],
@@ -115,43 +141,186 @@ json_payload=$(cat <<EOF
 }
 EOF
 )
+fi
 
 ###############################################################################
 # Step 6: Print debug info
 ###############################################################################
-#echo "[DEBUG] JSON Payload to OpenAI (below):"
+#echo "[DEBUG] JSON Payload to $api_provider API (below):"
 #echo "----------------------------------------------------------------------"
 #echo "$json_payload"
 #echo "----------------------------------------------------------------------"
 
 ###############################################################################
-# Step 7: Make the API request
+# Step 7: Make the API request based on provider
 ###############################################################################
-response=$(curl -s \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -d "$json_payload" \
-  https://api.openai.com/v1/chat/completions )
+commit_summary=""
+gemini_error=""
+openai_error=""
+api_success=false
 
-###############################################################################
-# Step 8: Parse the response to extract the generated content
-###############################################################################
-# If you have jq installed, it’s much cleaner:
-if command -v jq >/dev/null 2>&1; then
-  commit_summary=$(echo "$response" | jq -r '.choices[0].message.content // empty')
-else
-  # Fallback to grep + sed if jq not available
-  commit_summary=$(echo "$response" \
-    | grep -o '"content":"[^"]*"' \
-    | sed 's/"content":"\(.*\)"/\1/g')
+if [[ "$api_provider" == "gemini" ]]; then
+  # Try Gemini API first
+  echo "Trying Gemini API..."
+  gemini_response=$(curl -s \
+    -H "Content-Type: application/json" \
+    -d "$json_payload" \
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key=$GEMINI_API_KEY")
+  
+  # Check if Gemini response contains error
+  if [[ $gemini_response == *"error"* ]]; then
+    gemini_error=$(echo "$gemini_response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"\(.*\)"/\1/g')
+    echo "Gemini API error: $gemini_error"
+    
+    # Only fall back to OpenAI if OPENAI_API_KEY is available
+    if [[ -n "$OPENAI_API_KEY" ]]; then
+      echo "Falling back to OpenAI API..."
+      # Construct OpenAI payload
+      openai_payload=$(cat <<EOF
+{
+  "model": "gpt-3.5-turbo",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant specialized in writing concise commit messages."
+    },
+    {
+      "role": "user", 
+      "content": $prompt_json
+    }
+  ],
+  "temperature": 0.7
+}
+EOF
+)
+      # Make OpenAI request
+      openai_response=$(curl -s \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $OPENAI_API_KEY" \
+        -d "$openai_payload" \
+        https://api.openai.com/v1/chat/completions)
+      
+      # Check if OpenAI response contains error
+      if [[ $openai_response == *"error"* ]]; then
+        openai_error=$(echo "$openai_response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"\(.*\)"/\1/g')
+        echo "OpenAI API error: $openai_error"
+      else
+        # Parse OpenAI response
+        response=$openai_response
+        if command -v jq >/dev/null 2>&1; then
+          commit_summary=$(echo "$response" | jq -r '.choices[0].message.content // empty')
+        else
+          commit_summary=$(echo "$response" \
+            | grep -o '"content":"[^"]*"' \
+            | sed 's/"content":"\(.*\)"/\1/g')
+        fi
+        
+        if [[ -n "$commit_summary" ]]; then
+          api_success=true
+        fi
+      fi
+    else
+      echo "OpenAI API key is not available."
+    fi
+  else
+    # Parse successful Gemini response
+    response=$gemini_response
+    if command -v jq >/dev/null 2>&1; then
+      commit_summary=$(echo "$response" | jq -r '.candidates[0].content.parts[0].text // empty')
+    else
+      commit_summary=$(echo "$response" \
+        | grep -o '"text":"[^"]*"' \
+        | sed 's/"text":"\(.*\)"/\1/g')
+    fi
+    
+    if [[ -n "$commit_summary" ]]; then
+      api_success=true
+    fi
+  fi
+else # openai as primary choice
+  echo "Trying OpenAI API..."
+  openai_response=$(curl -s \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -d "$json_payload" \
+    https://api.openai.com/v1/chat/completions)
+    
+  # Check if OpenAI response contains error
+  if [[ $openai_response == *"error"* ]]; then
+    openai_error=$(echo "$openai_response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"\(.*\)"/\1/g')
+    echo "OpenAI API error: $openai_error"
+    
+    # Only fall back to Gemini if GEMINI_API_KEY is available
+    if [[ -n "$GEMINI_API_KEY" ]]; then
+      echo "Falling back to Gemini API..."
+      gemini_response=$(curl -s \
+        -H "Content-Type: application/json" \
+        -d "$json_payload" \
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key=$GEMINI_API_KEY")
+      
+      # Check if Gemini response contains error
+      if [[ $gemini_response == *"error"* ]]; then
+        gemini_error=$(echo "$gemini_response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"\(.*\)"/\1/g')
+        echo "Gemini API error: $gemini_error"
+      else
+        # Parse successful Gemini response
+        response=$gemini_response
+        if command -v jq >/dev/null 2>&1; then
+          commit_summary=$(echo "$response" | jq -r '.candidates[0].content.parts[0].text // empty')
+        else
+          commit_summary=$(echo "$response" \
+            | grep -o '"text":"[^"]*"' \
+            | sed 's/"text":"\(.*\)"/\1/g')
+        fi
+        
+        if [[ -n "$commit_summary" ]]; then
+          api_success=true
+        fi
+      fi
+    else
+      echo "Gemini API key is not available."
+    fi
+  else
+    # Parse OpenAI response
+    response=$openai_response
+    if command -v jq >/dev/null 2>&1; then
+      commit_summary=$(echo "$response" | jq -r '.choices[0].message.content // empty')
+    else
+      commit_summary=$(echo "$response" \
+        | grep -o '"content":"[^"]*"' \
+        | sed 's/"content":"\(.*\)"/\1/g')
+    fi
+    
+    if [[ -n "$commit_summary" ]]; then
+      api_success=true
+    fi
+  fi
 fi
 
-if [[ -z "$commit_summary" ]]; then
-  error_exit "OpenAI API did not return a commit summary. Response: $response"
+# Handle case where both APIs failed
+if [[ "$api_success" == "false" ]]; then
+  echo "Both APIs failed to generate a commit message."
+  echo "Gemini error: $gemini_error"
+  echo "OpenAI error: $openai_error"
+  
+  # Ask user if they want to continue with a manual commit message
+  echo "Do you want to enter a commit message manually? (y/n)"
+  read -r user_choice
+  
+  if [[ "$user_choice" == "y" || "$user_choice" == "Y" ]]; then
+    echo "Enter your commit message:"
+    read -r commit_summary
+    
+    if [[ -z "$commit_summary" ]]; then
+      error_exit "No commit message provided."
+    fi
+  else
+    error_exit "Aborting commit due to API failures."
+  fi
 fi
 
 ###############################################################################
 # Step 9: Commit with the generated summary
 ###############################################################################
+echo "Committing with message: $commit_summary"
 git commit -m "$commit_summary"
-
