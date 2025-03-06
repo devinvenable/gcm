@@ -31,45 +31,54 @@ fi
 # First check the environment variables
 api_provider=""
 
-# Try to find .env file containing API keys
-env_file=""
+# Find all .env files in the directory tree
+found_env_files=()
 search_dirs=("./" "../" "../../" "../../../" "../../../../../")
 for dir in "${search_dirs[@]}"; do
   candidate="${dir}.env"
   if [[ -f "$candidate" ]]; then
-    env_file="$candidate"
-    break
+    found_env_files+=("$candidate")
   fi
 done
 
-# If not found yet, do a broader find (up to 3 levels).
-if [[ -z "$env_file" ]]; then
+# If none found yet, do a broader find (up to 3 levels).
+if [[ ${#found_env_files[@]} -eq 0 ]]; then
   IFS=$'\n'
   for candidate in $(find ../../../ -maxdepth 3 -type f -name ".env" 2>/dev/null); do
-    env_file="$candidate"
-    break
+    found_env_files+=("$candidate")
   done
   unset IFS
 fi
 
-# Source the .env file if found
-if [[ -n "$env_file" ]]; then
+# Sort .env files by proximity to current directory (closest first)
+# and source them one by one until we have the keys we need
+api_provider=""
+for env_file in "${found_env_files[@]}"; do
   echo "Loading API keys from $env_file"
   set -a
   # shellcheck source=/dev/null
   . "$env_file"
   set +a
-fi
+  
+  # Check if we have the keys we need after sourcing this file
+  if [[ -n "$GEMINI_API_KEY" ]]; then
+    api_provider="gemini"
+    echo "Found Gemini API key in $env_file"
+    break
+  elif [[ -n "$OPENAI_API_KEY" && -z "$api_provider" ]]; then
+    api_provider="openai"
+    echo "Found OpenAI API key in $env_file"
+    # Don't break yet - we might find a Gemini key in another file
+  fi
+done
 
-# Determine which API to use (prefer Gemini over OpenAI)
-if [[ -n "$GEMINI_API_KEY" ]]; then
-  api_provider="gemini"
+# Final decision on which API to use (prefer Gemini over OpenAI)
+if [[ "$api_provider" == "gemini" ]]; then
   echo "Using Gemini API"
-elif [[ -n "$OPENAI_API_KEY" ]]; then
-  api_provider="openai"
+elif [[ "$api_provider" == "openai" ]]; then
   echo "Using OpenAI API (Gemini API key not found)"
 else
-  error_exit "Neither GEMINI_API_KEY nor OPENAI_API_KEY is defined in environment or in a .env file."
+  error_exit "Neither GEMINI_API_KEY nor OPENAI_API_KEY is defined in environment or in any .env file."
 fi
 
 ###############################################################################
@@ -164,9 +173,17 @@ if [[ "$api_provider" == "gemini" ]]; then
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key=$GEMINI_API_KEY")
   
   # Check if Gemini response contains error
-  if [[ $gemini_response == *"error"* ]]; then
+  if [[ $gemini_response == *"error"* && $gemini_response != *"candidates"* ]]; then
     gemini_error=$(echo "$gemini_response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"\(.*\)"/\1/g')
     echo "Gemini API error: $gemini_error"
+    echo "Full Gemini response: $gemini_response"
+    # Try to extract more detailed error information
+    if command -v jq >/dev/null 2>&1; then
+      echo "Gemini API error details:"
+      echo "$gemini_response" | jq '.error.details[] | .["@type"], .message' 2>/dev/null || echo "No detailed error information available"
+    else
+      echo "Install jq for more detailed error information"
+    fi
     
     # Only fall back to OpenAI if OPENAI_API_KEY is available
     if [[ -n "$OPENAI_API_KEY" ]]; then
@@ -193,7 +210,7 @@ EOF
         https://api.openai.com/v1/chat/completions)
       
       # Check if OpenAI response contains error
-      if [[ $openai_response == *"error"* ]]; then
+      if [[ $openai_response == *"error"* && $openai_response != *"choices"* ]]; then
         openai_error=$(echo "$openai_response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"\(.*\)"/\1/g')
         echo "OpenAI API error: $openai_error"
         echo "Full OpenAI response: $openai_response"
@@ -202,16 +219,42 @@ EOF
       else
         # Parse OpenAI response
         response=$openai_response
+        echo "OpenAI response received successfully."
+        
         if command -v jq >/dev/null 2>&1; then
+          echo "Using jq to parse response"
           commit_summary=$(echo "$response" | jq -r '.choices[0].message.content // empty')
         else
-          commit_summary=$(echo "$response" \
-            | grep -o '"content":"[^"]*"' \
-            | sed 's/"content":"\(.*\)"/\1/g')
+          echo "Using grep to parse response"
+          # Extract using Python for better JSON handling when jq is not available
+          if command -v python3 >/dev/null 2>&1; then
+            echo "Using python3 for JSON parsing"
+            commit_summary=$(python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    print(data['choices'][0]['message']['content'])
+except Exception as e:
+    print(f'Error parsing JSON: {e}', file=sys.stderr)
+    exit(1)
+" <<< "$response")
+          else
+            # Fallback to basic grep, but this may not handle complex JSON well
+            echo "Fallback to basic grep (limited JSON handling)"
+            commit_summary=$(echo "$response" \
+              | grep -o '"content": *"[^"]*' \
+              | head -1 \
+              | sed 's/"content": *"\(.*\)/\1/g' \
+              | sed 's/\\"/"/g')  # Unescape quotes
+          fi
         fi
         
+        echo "Extracted commit message: $commit_summary"
         if [[ -n "$commit_summary" ]]; then
           api_success=true
+          echo "Successfully extracted commit message from OpenAI"
+        else
+          echo "Failed to extract commit message from OpenAI response."
         fi
       fi
     else
@@ -220,16 +263,41 @@ EOF
   else
     # Parse successful Gemini response
     response=$gemini_response
+    echo "Gemini response received successfully."
+    
     if command -v jq >/dev/null 2>&1; then
+      echo "Using jq to parse response"
       commit_summary=$(echo "$response" | jq -r '.candidates[0].content.parts[0].text // empty')
     else
-      commit_summary=$(echo "$response" \
-        | grep -o '"text":"[^"]*"' \
-        | sed 's/"text":"\(.*\)"/\1/g')
+      echo "Using grep to parse response"
+      # Extract using Python for better JSON handling when jq is not available
+      if command -v python3 >/dev/null 2>&1; then
+        echo "Using python3 for JSON parsing"
+        commit_summary=$(python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    print(data['candidates'][0]['content']['parts'][0]['text'])
+except Exception as e:
+    print(f'Error parsing JSON: {e}', file=sys.stderr)
+    exit(1)
+" <<< "$response")
+      else
+        # Fallback to basic grep, but this may not handle complex JSON well
+        echo "Fallback to basic grep (limited JSON handling)"
+        commit_summary=$(echo "$response" \
+          | grep -o '"text":"[^"]*"' \
+          | head -1 \
+          | sed 's/"text":"\(.*\)"/\1/g')
+      fi
     fi
     
+    echo "Extracted commit message: $commit_summary"
     if [[ -n "$commit_summary" ]]; then
       api_success=true
+      echo "Successfully extracted commit message from Gemini"
+    else
+      echo "Failed to extract commit message from Gemini response."
     fi
   fi
 else # openai as primary choice
@@ -241,7 +309,7 @@ else # openai as primary choice
     https://api.openai.com/v1/chat/completions)
     
   # Check if OpenAI response contains error
-  if [[ $openai_response == *"error"* ]]; then
+  if [[ $openai_response == *"error"* && $openai_response != *"choices"* ]]; then
     openai_error=$(echo "$openai_response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"\(.*\)"/\1/g')
     echo "OpenAI API error: $openai_error"
     echo "Full OpenAI response: $openai_response"
@@ -255,22 +323,56 @@ else # openai as primary choice
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key=$GEMINI_API_KEY")
       
       # Check if Gemini response contains error
-      if [[ $gemini_response == *"error"* ]]; then
+      if [[ $gemini_response == *"error"* && $gemini_response != *"candidates"* ]]; then
         gemini_error=$(echo "$gemini_response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"\(.*\)"/\1/g')
         echo "Gemini API error: $gemini_error"
+        echo "Full Gemini response: $gemini_response"
+        # Try to extract more detailed error information
+        if command -v jq >/dev/null 2>&1; then
+          echo "Gemini API error details:"
+          echo "$gemini_response" | jq '.error.details[] | .["@type"], .message' 2>/dev/null || echo "No detailed error information available"
+        else
+          echo "Install jq for more detailed error information"
+        fi
+        
       else
         # Parse successful Gemini response
         response=$gemini_response
+        echo "Gemini response received successfully."
+        
         if command -v jq >/dev/null 2>&1; then
+          echo "Using jq to parse response"
           commit_summary=$(echo "$response" | jq -r '.candidates[0].content.parts[0].text // empty')
         else
-          commit_summary=$(echo "$response" \
-            | grep -o '"text":"[^"]*"' \
-            | sed 's/"text":"\(.*\)"/\1/g')
+          echo "Using grep to parse response"
+          # Extract using Python for better JSON handling when jq is not available
+          if command -v python3 >/dev/null 2>&1; then
+            echo "Using python3 for JSON parsing"
+            commit_summary=$(python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    print(data['candidates'][0]['content']['parts'][0]['text'])
+except Exception as e:
+    print(f'Error parsing JSON: {e}', file=sys.stderr)
+    exit(1)
+" <<< "$response")
+          else
+            # Fallback to basic grep, but this may not handle complex JSON well
+            echo "Fallback to basic grep (limited JSON handling)"
+            commit_summary=$(echo "$response" \
+              | grep -o '"text":"[^"]*"' \
+              | head -1 \
+              | sed 's/"text":"\(.*\)"/\1/g')
+          fi
         fi
         
+        echo "Extracted commit message: $commit_summary"
         if [[ -n "$commit_summary" ]]; then
           api_success=true
+          echo "Successfully extracted commit message from Gemini"
+        else
+          echo "Failed to extract commit message from Gemini response."
         fi
       fi
     else
@@ -279,16 +381,42 @@ else # openai as primary choice
   else
     # Parse OpenAI response
     response=$openai_response
+    echo "OpenAI response received successfully."
+    
     if command -v jq >/dev/null 2>&1; then
+      echo "Using jq to parse response"
       commit_summary=$(echo "$response" | jq -r '.choices[0].message.content // empty')
     else
-      commit_summary=$(echo "$response" \
-        | grep -o '"content":"[^"]*"' \
-        | sed 's/"content":"\(.*\)"/\1/g')
+      echo "Using grep to parse response"
+      # Extract using Python for better JSON handling when jq is not available
+      if command -v python3 >/dev/null 2>&1; then
+        echo "Using python3 for JSON parsing"
+        commit_summary=$(python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    print(data['choices'][0]['message']['content'])
+except Exception as e:
+    print(f'Error parsing JSON: {e}', file=sys.stderr)
+    exit(1)
+" <<< "$response")
+      else
+        # Fallback to basic grep, but this may not handle complex JSON well
+        echo "Fallback to basic grep (limited JSON handling)"
+        commit_summary=$(echo "$response" \
+          | grep -o '"content": *"[^"]*' \
+          | head -1 \
+          | sed 's/"content": *"\(.*\)/\1/g' \
+          | sed 's/\\"/"/g')  # Unescape quotes
+      fi
     fi
     
+    echo "Extracted commit message: $commit_summary"
     if [[ -n "$commit_summary" ]]; then
       api_success=true
+      echo "Successfully extracted commit message from OpenAI"
+    else
+      echo "Failed to extract commit message from OpenAI response."
     fi
   fi
 fi
@@ -313,6 +441,8 @@ if [[ "$api_success" == "false" ]]; then
   else
     error_exit "Aborting commit due to API failures."
   fi
+else
+  echo "Successfully generated commit message."
 fi
 
 ###############################################################################
