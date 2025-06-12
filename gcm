@@ -88,16 +88,19 @@ fi
 # This prompt is more explicit, guiding the LLM to analyze the function context diff
 # more reliably and improving the accuracy of the added/removed functions list.
 read -r -d '' prompt <<EOF
-You are a helpful coding assistant. Please read the following Git diff, which has been generated with full function context for each change. Your task is to generate a concise and accurate commit message.
+You are a helpful coding assistant. Please read the following Git diff and generate a concise and accurate commit message.
 
 The first line of your output should be a single sentence that summarizes the entire change.
 
-Following the summary, if any functions were clearly added or removed, list them under the headings "**Functions Added:**" and "**Functions Removed:**".
+After the main summary, you will add a list of functions.
 
-- A function should be listed as **added** only if its entire definition is new (all its lines start with '+').
-- A function should be listed as **removed** only if its entire definition is deleted (all its lines start with '-').
-- If a function was just modified (contains both '+' and '-' lines), do not list it in this section.
-- If no functions were added or removed, please omit this section entirely.
+**IMPORTANT RULE:** If NO functions were added or removed, you MUST NOT include the "**Functions Added:**" or "**Functions Removed:**" headings in your output. Do not write "None" or any other placeholder. The section must be omitted entirely.
+
+If and only if functions were added or removed, include them under the exact headings "**Functions Added:**" and "**Functions Removed:**", followed by a bulleted list of function names.
+
+- A function is **added** if its entire definition is new (all its lines start with '+').
+- A function is **removed** if its entire definition is deleted (all its lines start with '-').
+- If a function was only modified, do not list it.
 
 Here is the diff:
 
@@ -180,7 +183,7 @@ if [[ "$api_provider" == "gemini" ]]; then
   gemini_response=$(curl -s \
     -H "Content-Type: application/json" \
     -d "$json_payload" \
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key=$GEMINI_API_KEY")
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY")
 
   # Check if Gemini response contains error
   if [[ $gemini_response == *"error"* && $gemini_response != *"candidates"* ]]; then
@@ -330,7 +333,7 @@ else # openai as primary choice
       gemini_response=$(curl -s \
         -H "Content-Type: application/json" \
         -d "$json_payload" \
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent?key=$GEMINI_API_KEY")
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$GEMINI_API_KEY")
 
       # Check if Gemini response contains error
       if [[ $gemini_response == *"error"* && $gemini_response != *"candidates"* ]]; then
@@ -458,9 +461,23 @@ fi
 ###############################################################################
 # Step 8: Clean up the generated commit message
 ###############################################################################
-# Remove any "Functions added/removed: None" lines that the LLM may have added.
-# The 'I' flag for case-insensitivity requires GNU sed.
-commit_summary=$(echo "$commit_summary" | sed -E '/^[[:space:]]*(\*\*?)?Functions (added|removed):(\*\*?)?[[:space:]]*None[[:space:]]*$/Id')
+# This awk script removes a header (e.g., "**Functions Added:**") if it is
+# immediately followed by a line containing only a "- None" list item.
+commit_summary=$(echo "$commit_summary" | awk '
+  /^[[:space:]]*\*\*Functions (Added|Removed):\*\*[[:space:]]*$/ {
+    buffer = $0;
+    if (getline > 0) {
+      if ($0 ~ /^[[:space:]]*-[[:space:]]+None[[:space:]]*$/) {
+        next;
+      } else {
+        print buffer;
+      }
+    } else {
+      print buffer;
+    }
+  }
+  { print }
+')
 
 # Remove any trailing blank lines that might result from the deletion.
 commit_summary=$(echo "$commit_summary" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba')
